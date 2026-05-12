@@ -168,3 +168,89 @@ jobs:
           S3_REGION: ${{ secrets.S3_REGION }}
           GITHUB_ACTIONS: true
         run: uv run python -m trendradar
+
+      - name: Send Feishu Private Message
+        if: success()
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_USER_OPEN_ID: ${{ secrets.FEISHU_USER_OPEN_ID }}
+        run: |
+          # 获取最新的HTML报告文件
+          REPORT_FILE=$(ls -t output/*.html 2>/dev/null | head -1)
+          if [ -z "$REPORT_FILE" ]; then
+            echo "No HTML report found, skipping Feishu notification"
+            exit 0
+          fi
+          
+          echo "Found report: $REPORT_FILE"
+          
+          # 提取报告摘要（获取标题和前5000字符的内容预览）
+          REPORT_TITLE=$(grep -o '<title>[^<]*</title>' "$REPORT_FILE" | head -1 | sed 's/<[^>]*>//g')
+          if [ -z "$REPORT_TITLE" ]; then
+            REPORT_TITLE="TrendRadar 财经热点报告"
+          fi
+          
+          # 获取摘要内容（前8000字符，去除HTML标签）
+          REPORT_SUMMARY=$(sed -n '1,8000p' "$REPORT_FILE" | sed 's/<[^>]*>//g' | sed '/^[[:space:]]*$/d' | head -100 | tr '\n' ' ' | cut -c1-4000)
+          
+          if [ -z "$REPORT_SUMMARY" ]; then
+            REPORT_SUMMARY="查看完整报告请访问 GitHub Actions 运行日志"
+          fi
+          
+          echo "Report title: $REPORT_TITLE"
+          echo "Report summary (first 200 chars): $(echo $REPORT_SUMMARY | cut -c1-200)..."
+          
+          # 获取飞书 tenant_access_token
+          TOKEN_RESPONSE=$(curl -s -X POST "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
+            -H "Content-Type: application/json" \
+            -d "{\"app_id\": \"$FEISHU_APP_ID\", \"app_secret\": \"$FEISHU_APP_SECRET\"}")
+          
+          echo "Token response: $TOKEN_RESPONSE"
+          
+          TENANT_TOKEN=$(echo $TOKEN_RESPONSE | grep -o '"tenant_access_token":"[^"]*"' | cut -d'"' -f4)
+          
+          if [ -z "$TENANT_TOKEN" ]; then
+            echo "Failed to get tenant access token"
+            exit 1
+          fi
+          
+          echo "Got tenant access token successfully"
+          
+          # 构建消息内容
+          CURRENT_TIME=$(date "+%Y-%m-%d %H:%M:%S")
+          
+          # 使用飞书卡片消息格式
+          MESSAGE_JSON=$(cat <<EOF
+{
+  "receive_id": "$FEISHU_USER_OPEN_ID",
+  "msg_type": "interactive",
+  "content": "{\\"schema\\":\\"2.0\\",\\"body\\":{\\"elements\\":[{\\"tag\\":\\"markdown\\",\\"content\\":\\"## 📊 TrendRadar 财经热点报告\\n\\n**生成时间**: $CURRENT_TIME\\n\\n---\\n\\n$REPORT_SUMMARY\\n\\n---\\n\\n*💡 查看完整报告请访问 GitHub Actions 运行日志*\\n\\n*🔄 此报告由 TrendRadar GitHub Actions 自动生成*\\"}}]}}"
+}
+EOF
+)
+          
+          echo "Sending message to Feishu private chat..."
+          
+          # 发送消息
+          SEND_RESPONSE=$(curl -s -X POST "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id" \
+            -H "Authorization: Bearer $TENANT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$MESSAGE_JSON")
+          
+          echo "Send response: $SEND_RESPONSE"
+          
+          # 检查发送结果
+          if echo "$SEND_RESPONSE" | grep -q '"code":0'; then
+            echo "✅ Feishu private message sent successfully!"
+          else
+            echo "⚠️ Failed to send Feishu message, but crawler ran successfully"
+          fi
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trendradar-report
+          path: output/
+          retention-days: 7
